@@ -50,15 +50,38 @@ Key mechanics:
 
 - **Isolation**: children run with `-nc -ns -np --no-themes -ne -na
   --no-session` — no conversation history, no AGENTS.md, no skills, no
-  discovered extensions, no project-local config. Only the two orchestrator
-  personas get this extension loaded (`-e`) so they can nest `egm_subagent`.
+  discovered extensions, no project-local config. They also get a fixed
+  `--system-prompt`, so a user `SYSTEM.md` cannot reach them. Only the two
+  orchestrator personas get this extension loaded (`-e`) so they can nest
+  `egm_subagent`.
+- **Failures**: a child that returns no report, or is cut off at the output
+  token limit, is reported as failed rather than completed.
+- **Timeouts**: read-only children stop after 30 minutes and orchestrators after
+  120. Set `EGM_PI_TIMEOUT_MINUTES` to change the read-only limit; orchestrators
+  get four times that value.
 - **Depth**: `EGM_PI_DEPTH` tracks delegation depth; `egm_subagent` refuses to
-  spawn at depth 2 (Elephant → orchestrator → reviewers).
+  spawn at depth 2 (Elephant → orchestrator → reviewers), or depth 3 under
+  `egm-bootstrap-orchestrator` (root → worker → scouts).
+- **Output**: one tool result holds at most 100 KB of reports, and 50 KB per
+  task. A longer report is truncated, with a note naming a private temp file
+  that holds the full text.
+- **Models**: children inherit the parent's model but start with no extensions
+  and no `--api-key`. If your provider comes from an extension, including the
+  built-in `llama.cpp`, set `EGM_PI_CHILD_EXTENSIONS` to a comma-separated list
+  such as `/path/to/provider.ts,builtin:llama.cpp`. Those extensions run in
+  every child and can change what reviewers see, so list only what the model
+  needs.
+- **Review records**: the guidance tells the model to copy
+  `goldfish_review_report.md` to `goldfish_review_report_stage<N>_round<M>.md`
+  before a later round or stage overwrites it. Upstream reuses that one filename.
+- **Filesystem**: isolation covers context and tools. Reviewers can still read
+  any file your account can.
 - **Paths**: skill text references like `agents/`, `resources/`, `docs/`
   resolve against the vendored plugin root (`egm/`), told to both the parent
   (via system-prompt guidance) and each child (via an appended system prompt).
 - **Artifacts**: written to the working directory unless the user sets
-  `EGM artifact directory: <path>` in the prompt or AGENTS.md.
+  `EGM artifact directory: <path>` on its own line in the prompt or AGENTS.md.
+  The extension passes the setting to writing subagents automatically.
 
 ## Develop
 

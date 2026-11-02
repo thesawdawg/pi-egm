@@ -14,6 +14,7 @@ import { Type } from "typebox";
 import { PersonaRegistry } from "./personas.ts";
 import {
 	MAX_PARALLEL_TASKS,
+	parseArtifactDirectory,
 	type SubagentResult,
 	SubagentRunner,
 	type SubagentTask,
@@ -61,12 +62,19 @@ export function buildEgmGuidance(egmRoot: string): string {
 	return [
 		"## Elephant-Goldfish Model (EGM)",
 		"",
-		`- EGM plugin root: ${egmRoot}. Relative paths in EGM skill text (\`agents/\`, \`resources/\`, \`docs/\`) resolve against this directory.`,
+		`- EGM plugin root: ${egmRoot}. Relative \`agents/\`, \`resources/\`, \`docs/\`, and \`skills/\` paths in EGM skill text resolve against this directory; \`references/\` resolves against the active skill's directory.`,
 		"- EGM skills are explicit-only: invoke them as `/skill:egm-<name>` (e.g. `/skill:egm-review`).",
-		'- When EGM skill text says "spawn a subagent", use the `egm_subagent` tool with the persona name from `agents/*.md` frontmatter (e.g. `egm-zoom-out`). `egm-synthesizer` and `egm-bootstrap-orchestrator` may nest `egm_subagent` calls; maximum delegation depth is 2.',
+		'- When EGM skill text says "spawn a subagent", use the `egm_subagent` tool with the persona name from `agents/*.md` frontmatter (e.g. `egm-zoom-out`). `egm-synthesizer` and `egm-bootstrap-orchestrator` may nest `egm_subagent` calls; maximum delegation depth is 2, or 3 under `egm-bootstrap-orchestrator`.',
 		'- For ad-hoc read-only scouts such as `goldfish-explorer`, call `egm_subagent` with persona `general` and pass the scout\'s system prompt via `systemPrompt`.',
-		'- The Codex/Claude lines in EGM skills ("first read docs/codex.md", `${CLAUDE_PLUGIN_ROOT}/docs/claude.md`) do not apply on pi; ignore them.',
-		"- Artifact directory: the working directory, unless the user sets `EGM artifact directory: <path>` in the prompt or AGENTS.md.",
+		'- The Codex/Claude lines in EGM skills ("first read docs/codex.md", `${CLAUDE_PLUGIN_ROOT}/docs/claude.md`) do not apply on pi. Follow these rules instead:',
+		"  - `/skill:` commands are for the user. When a skill hands off to another EGM skill (for example `egm-resolve` or `egm-review-loop`), read `skills/<name>/SKILL.md` under the plugin root and follow it in this thread.",
+		"  - Keep review stages 5, 6, 7, 8, and 9 sequential. Parallelize only reviewers within a stage, and write each stage's report before starting the next. Uninterrupted mode skips human checkpoints, not this order.",
+		"  - Give a subagent only its task, absolute paths to the target, standards, and supplied Goldfish context. Never copy this conversation, your reasoning, or answers the document is supposed to explain.",
+		"  - Reviewers cannot open URLs. Save a page to a workspace file and pass that path instead.",
+		"  - A reviewer that fails, times out, or returns no report did not review. Retry it once, then report it as not run.",
+		"  - `goldfish_review_report.md` is reused by every review round and stage. Before anything overwrites it, copy it unchanged to `goldfish_review_report_stage<N>_round<M>.md` in the same folder, so earlier findings and decisions stay on record.",
+		"  - pi has no question tool, so ask gate questions as one plain-text question and end your turn. No answer is not approval.",
+		"- Artifact directory: the working directory, unless the user sets `EGM artifact directory: <path>` in the prompt or AGENTS.md. egm_subagent passes this setting to its children automatically.",
 	].join("\n");
 }
 
@@ -78,8 +86,11 @@ export function buildEgmGuidance(egmRoot: string): string {
  */
 function formatResultSection(result: SubagentResult): string {
 	const status = result.status === "completed" ? "completed" : `failed (${result.status})`;
-	const output = result.output || result.errorMessage || result.stderr.trim() || "(no output)";
-	return `### [${result.persona}] ${status}\n\n${output}`;
+	// A failed child may still have partial text; the error must stay beside it
+	// so partial findings are never mistaken for a complete report.
+	const failure = result.status === "completed" ? "" : result.errorMessage || result.stderr.trim();
+	const body = [failure && `Error: ${failure}`, result.output].filter(Boolean).join("\n\n") || "(no output)";
+	return `### [${result.persona}] ${status}\n\n${body}`;
 }
 
 /**
@@ -92,6 +103,21 @@ export default function egmExtension(pi: ExtensionAPI): void {
 	const registry = PersonaRegistry.load(AGENTS_DIR);
 	const runner = new SubagentRunner(registry, EGM_ROOT, EXTENSION_PATH);
 	const guidance = buildEgmGuidance(EGM_ROOT);
+	// A prompt setting outlives its turn, like the skill workflow it configures.
+	let promptArtifactDir: string | undefined;
+	let contextArtifactDir: string | undefined;
+
+	/**
+	 * Resolves the artifact directory for this process's children: prompt first,
+	 * then context files, then whatever a parent EGM process passed down.
+	 *
+	 * @param cwd - Directory a relative setting resolves against.
+	 * @returns The absolute directory, or undefined when unset.
+	 */
+	const resolveArtifactDir = (cwd: string): string | undefined => {
+		const configured = promptArtifactDir ?? contextArtifactDir ?? runner.inheritedArtifactDir();
+		return configured ? path.resolve(cwd, configured) : undefined;
+	};
 
 	pi.registerTool({
 		name: "egm_subagent",
@@ -102,13 +128,13 @@ export default function egmExtension(pi: ExtensionAPI): void {
 			'Personas come from the EGM plugin\'s agents/*.md frontmatter names plus "general"',
 			"(a generic read-only agent; supply its persona via the per-task systemPrompt, e.g. the",
 			"goldfish-explorer scout). egm-synthesizer and egm-bootstrap-orchestrator can nest",
-			"egm_subagent calls themselves; maximum delegation depth is 2.",
+			"egm_subagent calls themselves; maximum delegation depth is 2, or 3 under egm-bootstrap-orchestrator.",
 		].join(" "),
 		promptSnippet: "egm_subagent — spawn EGM Goldfish subagents in fresh-context child pi processes",
 		promptGuidelines: [
 			'When EGM skill text says "spawn a subagent" and names a persona, call egm_subagent with that persona name and pass the task prompt verbatim.',
 			'For runtime scout personas such as goldfish-explorer, use persona "general" and pass the scout system prompt via systemPrompt.',
-			'egm_subagent refuses to spawn beyond delegation depth 2; a reviewer that fails or cannot run is "not run", never a zero-finding review.',
+			'egm_subagent refuses to spawn beyond the delegation depth limit; a reviewer that fails or cannot run is "not run", never a zero-finding review.',
 		],
 		parameters: EgmSubagentParams,
 
@@ -129,6 +155,7 @@ export default function egmExtension(pi: ExtensionAPI): void {
 				{
 					model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 					thinkingLevel: ctx.thinkingLevel,
+					artifactDir: resolveArtifactDir(ctx.cwd),
 				},
 				signal,
 				(result, done, total) => {
@@ -180,7 +207,12 @@ export default function egmExtension(pi: ExtensionAPI): void {
 
 	// 0.84.2 has no systemPromptOptions.sections; replace the assembled prompt
 	// with itself plus our constant section (chained safely with other extensions).
-	pi.on("before_agent_start", (event) => ({
-		systemPrompt: `${event.systemPrompt}\n\n${guidance}`,
-	}));
+	pi.on("before_agent_start", (event) => {
+		// Children run with no context files, so capture the setting here instead
+		// of relying on the model to relay it.
+		contextArtifactDir = parseArtifactDirectory(event.systemPrompt);
+		const prompt = "prompt" in event ? event.prompt : undefined;
+		promptArtifactDir = parseArtifactDirectory(prompt) ?? promptArtifactDir;
+		return { systemPrompt: `${event.systemPrompt}\n\n${guidance}` };
+	});
 }
