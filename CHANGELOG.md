@@ -9,11 +9,21 @@
 - Child `pi` processes no longer load a user-level `SYSTEM.md`.
 - `EGM artifact directory` now reaches writing subagents, which run without
   context files.
+- `egm-bootstrap-orchestrator` chains can reach their scouts (depth limit 3).
+- One `egm_subagent` result is limited to 100 KB of reports; oversized reports
+  are saved to a temp file instead of being lost.
+- System-prompt guidance now carries the harness rules from the Claude and
+  Codex docs it tells the model to skip, and explains how to reach hidden skills.
+- Long reports no longer contain corrupted characters from split UTF-8 in child
+  output or truncation.
+- Model setup failures in children now explain how to fix them.
 
 ### Added
 
 - Per-child timeouts: 30 minutes for read-only personas, 120 for orchestrators.
   `EGM_PI_TIMEOUT_MINUTES` overrides the read-only limit.
+- `EGM_PI_CHILD_EXTENSIONS` loads named extensions into children, for models
+  from extension-registered providers.
 
 ## [0.1.0]
 

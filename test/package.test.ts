@@ -50,4 +50,6 @@ test("guidance names the absolute egm root and egm_subagent", () => {
 	assert.ok(path.isAbsolute(EGM_ROOT));
 	assert.ok(guidance.includes("egm_subagent"));
 	assert.ok(guidance.includes("EGM artifact directory"));
+	assert.ok(guidance.includes("skills/<name>/SKILL.md"), "hidden sibling skills must be reachable");
+	assert.ok(guidance.includes("sequential"), "replaces the rule from docs/claude.md");
 });

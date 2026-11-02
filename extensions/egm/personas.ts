@@ -15,6 +15,19 @@ export const SUBAGENT_TOOL_NAME = "egm_subagent";
 /** Persona name accepted for a generic read-only agent with no persona file. */
 export const GENERAL_PERSONA = "general";
 
+/**
+ * Deepest egm_subagent call depth: Elephant (0) -> orchestrator/synthesizer
+ * (1) -> reviewers/scouts (2). At this depth the tool refuses to spawn.
+ */
+export const MAX_SPAWN_DEPTH = 2;
+
+/**
+ * Bootstrap needs one more level than review: Elephant -> root orchestrator ->
+ * worker orchestrator -> scouts. A refused scout would put placeholder text in
+ * generated READMEs, so the limit must fit the skill's real shape.
+ */
+export const BOOTSTRAP_MAX_SPAWN_DEPTH = 3;
+
 /** Tools every read-only Goldfish subagent gets: inspect, never modify. */
 const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
 
@@ -46,6 +59,8 @@ export interface PersonaPolicy {
 	tools: string[];
 	/** Whether the child loads this extension so it can call egm_subagent itself. */
 	canNest: boolean;
+	/** Depth at which a process running this persona may no longer spawn. */
+	maxSpawnDepth: number;
 }
 
 /**
@@ -57,7 +72,10 @@ export interface PersonaPolicy {
  */
 export function policyForPersona(name: string): PersonaPolicy {
 	const tools = NESTING_PERSONA_TOOLS[name];
-	return tools ? { tools: [...tools], canNest: true } : { tools: [...READ_ONLY_TOOLS], canNest: false };
+	const maxSpawnDepth = name === "egm-bootstrap-orchestrator" ? BOOTSTRAP_MAX_SPAWN_DEPTH : MAX_SPAWN_DEPTH;
+	return tools
+		? { tools: [...tools], canNest: true, maxSpawnDepth }
+		: { tools: [...READ_ONLY_TOOLS], canNest: false, maxSpawnDepth };
 }
 
 /**

@@ -62,11 +62,17 @@ export function buildEgmGuidance(egmRoot: string): string {
 	return [
 		"## Elephant-Goldfish Model (EGM)",
 		"",
-		`- EGM plugin root: ${egmRoot}. Relative paths in EGM skill text (\`agents/\`, \`resources/\`, \`docs/\`) resolve against this directory.`,
+		`- EGM plugin root: ${egmRoot}. Relative \`agents/\`, \`resources/\`, \`docs/\`, and \`skills/\` paths in EGM skill text resolve against this directory; \`references/\` resolves against the active skill's directory.`,
 		"- EGM skills are explicit-only: invoke them as `/skill:egm-<name>` (e.g. `/skill:egm-review`).",
-		'- When EGM skill text says "spawn a subagent", use the `egm_subagent` tool with the persona name from `agents/*.md` frontmatter (e.g. `egm-zoom-out`). `egm-synthesizer` and `egm-bootstrap-orchestrator` may nest `egm_subagent` calls; maximum delegation depth is 2.',
+		'- When EGM skill text says "spawn a subagent", use the `egm_subagent` tool with the persona name from `agents/*.md` frontmatter (e.g. `egm-zoom-out`). `egm-synthesizer` and `egm-bootstrap-orchestrator` may nest `egm_subagent` calls; maximum delegation depth is 2, or 3 under `egm-bootstrap-orchestrator`.',
 		'- For ad-hoc read-only scouts such as `goldfish-explorer`, call `egm_subagent` with persona `general` and pass the scout\'s system prompt via `systemPrompt`.',
-		'- The Codex/Claude lines in EGM skills ("first read docs/codex.md", `${CLAUDE_PLUGIN_ROOT}/docs/claude.md`) do not apply on pi; ignore them.',
+		'- The Codex/Claude lines in EGM skills ("first read docs/codex.md", `${CLAUDE_PLUGIN_ROOT}/docs/claude.md`) do not apply on pi. Follow these rules instead:',
+		"  - `/skill:` commands are for the user. When a skill hands off to another EGM skill (for example `egm-resolve` or `egm-review-loop`), read `skills/<name>/SKILL.md` under the plugin root and follow it in this thread.",
+		"  - Keep review stages 5, 6, 7, 8, and 9 sequential. Parallelize only reviewers within a stage, and write each stage's report before starting the next. Uninterrupted mode skips human checkpoints, not this order.",
+		"  - Give a subagent only its task, absolute paths to the target, standards, and supplied Goldfish context. Never copy this conversation, your reasoning, or answers the document is supposed to explain.",
+		"  - Reviewers cannot open URLs. Save a page to a workspace file and pass that path instead.",
+		"  - A reviewer that fails, times out, or returns no report did not review. Retry it once, then report it as not run.",
+		"  - pi has no question tool, so ask gate questions as one plain-text question and end your turn. No answer is not approval.",
 		"- Artifact directory: the working directory, unless the user sets `EGM artifact directory: <path>` in the prompt or AGENTS.md. egm_subagent passes this setting to its children automatically.",
 	].join("\n");
 }
@@ -121,13 +127,13 @@ export default function egmExtension(pi: ExtensionAPI): void {
 			'Personas come from the EGM plugin\'s agents/*.md frontmatter names plus "general"',
 			"(a generic read-only agent; supply its persona via the per-task systemPrompt, e.g. the",
 			"goldfish-explorer scout). egm-synthesizer and egm-bootstrap-orchestrator can nest",
-			"egm_subagent calls themselves; maximum delegation depth is 2.",
+			"egm_subagent calls themselves; maximum delegation depth is 2, or 3 under egm-bootstrap-orchestrator.",
 		].join(" "),
 		promptSnippet: "egm_subagent — spawn EGM Goldfish subagents in fresh-context child pi processes",
 		promptGuidelines: [
 			'When EGM skill text says "spawn a subagent" and names a persona, call egm_subagent with that persona name and pass the task prompt verbatim.',
 			'For runtime scout personas such as goldfish-explorer, use persona "general" and pass the scout system prompt via systemPrompt.',
-			'egm_subagent refuses to spawn beyond delegation depth 2; a reviewer that fails or cannot run is "not run", never a zero-finding review.',
+			'egm_subagent refuses to spawn beyond the delegation depth limit; a reviewer that fails or cannot run is "not run", never a zero-finding review.',
 		],
 		parameters: EgmSubagentParams,
 

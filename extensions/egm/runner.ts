@@ -10,9 +10,12 @@ import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { type PersonaRegistry, policyForPersona } from "./personas.ts";
+
+export { BOOTSTRAP_MAX_SPAWN_DEPTH, MAX_SPAWN_DEPTH } from "./personas.ts";
 
 /** Maximum tasks accepted in one egm_subagent call. */
 export const MAX_PARALLEL_TASKS = 8;
@@ -24,10 +27,10 @@ export const MAX_CONCURRENCY = 4;
 export const PER_TASK_OUTPUT_CAP = 50 * 1024;
 
 /**
- * Deepest egm_subagent call depth: Elephant (0) -> orchestrator/synthesizer
- * (1) -> reviewers/scouts (2). At depth 2 the tool refuses to spawn.
+ * Cap on all task output in one tool result. Direct dispatch would otherwise
+ * put eight full reports in the Elephant's context, which EGM exists to protect.
  */
-export const MAX_SPAWN_DEPTH = 2;
+export const TOTAL_OUTPUT_CAP = 100 * 1024;
 
 /** Env var carrying the current delegation depth into child processes. */
 const DEPTH_ENV_VAR = "EGM_PI_DEPTH";
@@ -40,6 +43,12 @@ export const DEFAULT_TASK_TIMEOUT_MINUTES = 30;
  * several full reviewer runs; otherwise a healthy Synthesizer dies first.
  */
 export const NESTING_TIMEOUT_MULTIPLIER = 4;
+
+/** Env var telling a child which persona it is running, for its own spawn limit. */
+const PERSONA_ENV_VAR = "EGM_PI_PERSONA";
+
+/** Env var listing comma-separated extensions to load into every child. */
+const CHILD_EXTENSIONS_ENV_VAR = "EGM_PI_CHILD_EXTENSIONS";
 
 /** Env var overriding DEFAULT_TASK_TIMEOUT_MINUTES (slow local models need more). */
 const TIMEOUT_ENV_VAR = "EGM_PI_TIMEOUT_MINUTES";
@@ -92,7 +101,7 @@ export interface SubagentResult {
 	/** "completed" means the child delivered a full report; anything else is a failure. */
 	status: "completed" | "failed" | "aborted" | "timed_out";
 	exitCode: number;
-	/** Final assistant text, capped at PER_TASK_OUTPUT_CAP. */
+	/** Final assistant text, capped by taskOutputCap(); a truncation note names the full copy. */
 	output: string;
 	stderr: string;
 	stopReason?: string;
@@ -149,20 +158,46 @@ function getFinalOutput(messages: Message[]): string {
 }
 
 /**
- * Truncates output to PER_TASK_OUTPUT_CAP bytes without splitting a
- * multi-byte UTF-8 character.
+ * Output budget for each task in a call of the given size.
+ *
+ * @param taskCount - Number of tasks in the call.
+ * @returns The per-task cap in bytes.
+ */
+export function taskOutputCap(taskCount: number): number {
+	return Math.min(PER_TASK_OUTPUT_CAP, Math.floor(TOTAL_OUTPUT_CAP / Math.max(1, taskCount)));
+}
+
+/**
+ * Truncates output to a byte cap without splitting a multi-byte UTF-8
+ * character. The full text is saved to a private temp file so an oversized
+ * report stays readable instead of losing findings.
  *
  * @param output - Raw text to cap.
- * @returns The text, unchanged or truncated with a byte count note.
+ * @param cap - Maximum bytes to keep inline.
+ * @param persona - Persona name, used to name the saved file.
+ * @returns The text, unchanged or truncated with a note naming the saved copy.
  */
-function capOutput(output: string): string {
+export function capOutput(output: string, cap: number, persona: string): string {
 	const byteLength = Buffer.byteLength(output, "utf8");
-	if (byteLength <= PER_TASK_OUTPUT_CAP) return output;
-	let truncated = output.slice(0, PER_TASK_OUTPUT_CAP);
-	while (Buffer.byteLength(truncated, "utf8") > PER_TASK_OUTPUT_CAP) {
+	if (byteLength <= cap) return output;
+	let truncated = output.slice(0, cap);
+	while (Buffer.byteLength(truncated, "utf8") > cap) {
 		truncated = truncated.slice(0, -1);
 	}
-	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted]`;
+	// The loop can stop on half a surrogate pair, which encodes as U+FFFD.
+	const lastCodeUnit = truncated.charCodeAt(truncated.length - 1);
+	if (lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff) truncated = truncated.slice(0, -1);
+	let location = "The full report could not be saved.";
+	try {
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-egm-output-"));
+		const filePath = path.join(directory, `${persona.replace(/[^\w.-]+/g, "_")}.md`);
+		fs.writeFileSync(filePath, output, { encoding: "utf-8", mode: 0o600 });
+		location = `Read the full report at ${filePath}.`;
+	} catch {
+		// The inline text is still useful; the note above reports the lost copy.
+	}
+	const omitted = byteLength - Buffer.byteLength(truncated, "utf8");
+	return `${truncated}\n\n[Output truncated: ${omitted} bytes omitted. ${location}]`;
 }
 
 /**
@@ -205,6 +240,34 @@ export function parseArtifactDirectory(text: string | undefined): string | undef
 	const matches = [...text.matchAll(/^[ \t]*EGM artifact directory:[ \t]*(\S.*?)[ \t]*$/gm)];
 	const value = matches.at(-1)?.[1];
 	return value && !value.startsWith("<") ? value : undefined;
+}
+
+/**
+ * Parses the comma-separated child extension list.
+ *
+ * @param value - Raw EGM_PI_CHILD_EXTENSIONS value.
+ * @returns Extension paths or builtin:<name> entries; empty when unset.
+ */
+export function parseChildExtensions(value: string | undefined): string[] {
+	return (value ?? "")
+		.split(",")
+		.map((entry) => entry.trim())
+		.filter(Boolean);
+}
+
+/**
+ * Explains a child's model-setup failure, which the parent cannot detect up
+ * front because the parent itself has the extension or key the child lacks.
+ *
+ * @param detail - The child's error text.
+ * @returns How to fix it, or undefined for unrelated failures.
+ */
+export function explainModelFailure(detail: string): string | undefined {
+	if (!/Model ".*" not found|No API key found/.test(detail)) return undefined;
+	return (
+		"Subagents start without extensions and do not inherit --api-key. Set EGM_PI_CHILD_EXTENSIONS to the " +
+		"extension that registers this provider, or configure the key in models.json, auth.json, or an environment variable."
+	);
 }
 
 /**
@@ -253,12 +316,21 @@ export class SubagentRunner {
 	}
 
 	/**
-	 * Whether this process may still spawn subagents under MAX_SPAWN_DEPTH.
+	 * Spawn limit for this process, from the persona it is running.
 	 *
-	 * @returns True when currentDepth() is below MAX_SPAWN_DEPTH.
+	 * @returns The depth at which this process may no longer spawn.
+	 */
+	maxSpawnDepth(): number {
+		return policyForPersona(process.env[PERSONA_ENV_VAR] ?? "").maxSpawnDepth;
+	}
+
+	/**
+	 * Whether this process may still spawn subagents.
+	 *
+	 * @returns True when currentDepth() is below maxSpawnDepth().
 	 */
 	canSpawn(): boolean {
-		return this.currentDepth() < MAX_SPAWN_DEPTH;
+		return this.currentDepth() < this.maxSpawnDepth();
 	}
 
 	/**
@@ -270,7 +342,7 @@ export class SubagentRunner {
 		if (this.canSpawn()) return undefined;
 		return (
 			`egm_subagent refused: delegation depth ${this.currentDepth()} reached the maximum ` +
-			`of ${MAX_SPAWN_DEPTH} (Elephant -> synthesizer/orchestrator -> reviewers). ` +
+			`of ${this.maxSpawnDepth()} for this persona (Elephant -> synthesizer/orchestrator -> reviewers). ` +
 			`Perform the remaining work inline instead of spawning.`
 		);
 	}
@@ -343,7 +415,7 @@ export class SubagentRunner {
 			"",
 			"## Pi runtime notes (EGM)",
 			"",
-			`- EGM plugin root: ${this.egmRoot}. Resolve relative \`agents/\`, \`resources/\`, and \`docs/\` paths in these instructions against this directory.`,
+			`- EGM plugin root: ${this.egmRoot}. Resolve relative \`agents/\`, \`resources/\`, \`docs/\`, and \`skills/\` paths in these instructions against this directory.`,
 			"- If a file required by these instructions cannot be read, report an incomplete review instead of returning a verdict.",
 			`- ${toolingNote}`,
 		];
@@ -385,6 +457,11 @@ export class SubagentRunner {
 		const policy = policyForPersona(task.persona);
 		args.push("--tools", policy.tools.join(","));
 		if (policy.canNest) args.push("-e", this.extensionPath);
+		// -ne also removes extension-registered providers, so a user whose model
+		// comes from one must be able to opt that single extension back in.
+		for (const extension of parseChildExtensions(process.env[CHILD_EXTENSIONS_ENV_VAR])) {
+			args.push("-e", extension);
+		}
 		args.push("--append-system-prompt", promptFilePath);
 		args.push(`Task: ${task.task}`);
 		return args;
@@ -397,6 +474,7 @@ export class SubagentRunner {
 	 * @param cwd - Working directory for the child.
 	 * @param defaults - Model settings inherited from the parent.
 	 * @param signal - Parent abort signal; kills the child when aborted.
+	 * @param outputCap - Maximum output bytes returned inline.
 	 * @returns The task result; never throws for child failures.
 	 */
 	async runTask(
@@ -404,6 +482,7 @@ export class SubagentRunner {
 		cwd: string,
 		defaults: DispatchDefaults,
 		signal: AbortSignal | undefined,
+		outputCap: number = PER_TASK_OUTPUT_CAP,
 	): Promise<SubagentResult> {
 		const result: SubagentResult = {
 			persona: task.persona,
@@ -437,10 +516,14 @@ export class SubagentRunner {
 					env: {
 						...process.env,
 						[DEPTH_ENV_VAR]: String(this.currentDepth() + 1),
+						[PERSONA_ENV_VAR]: task.persona,
 						...(defaults.artifactDir ? { [ARTIFACT_DIR_ENV_VAR]: defaults.artifactDir } : {}),
 					},
 				});
 				let buffer = "";
+				// Pipe chunks can end inside a multi-byte character; decoding each
+				// chunk alone would corrupt reports that use emoji severity markers.
+				const stdoutDecoder = new StringDecoder("utf8");
 
 				const processLine = (line: string) => {
 					if (!line.trim()) return;
@@ -470,7 +553,7 @@ export class SubagentRunner {
 				};
 
 				proc.stdout.on("data", (data: Buffer) => {
-					buffer += data.toString();
+					buffer += stdoutDecoder.write(data);
 					const lines = buffer.split("\n");
 					buffer = lines.pop() || "";
 					for (const line of lines) processLine(line);
@@ -499,6 +582,7 @@ export class SubagentRunner {
 					resolve(code);
 				};
 				proc.on("close", (code) => {
+					buffer += stdoutDecoder.end();
 					if (buffer.trim()) processLine(buffer);
 					finish(code ?? 1);
 				});
@@ -511,7 +595,7 @@ export class SubagentRunner {
 				else signal?.addEventListener("abort", killProc, { once: true });
 			});
 
-			result.output = capOutput(getFinalOutput(messages));
+			result.output = capOutput(getFinalOutput(messages), outputCap, task.persona);
 			if (wasAborted) {
 				result.status = "aborted";
 			} else if (timedOut) {
@@ -525,6 +609,11 @@ export class SubagentRunner {
 				const problem = findReportProblem(result.stopReason, result.output);
 				if (problem) result.errorMessage = problem;
 				else result.status = "completed";
+			}
+			if (result.status === "failed") {
+				const detail = result.errorMessage || result.stderr.trim();
+				const hint = explainModelFailure(detail);
+				if (hint) result.errorMessage = `${detail} ${hint}`;
 			}
 			return result;
 		} finally {
@@ -551,8 +640,9 @@ export class SubagentRunner {
 		onProgress?: ProgressCallback,
 	): Promise<SubagentResult[]> {
 		let done = 0;
+		const outputCap = taskOutputCap(tasks.length);
 		return mapWithConcurrencyLimit(tasks, MAX_CONCURRENCY, async (task) => {
-			const result = await this.runTask(task, cwd, defaults, signal);
+			const result = await this.runTask(task, cwd, defaults, signal, outputCap);
 			done++;
 			onProgress?.(result, done, tasks.length);
 			return result;
