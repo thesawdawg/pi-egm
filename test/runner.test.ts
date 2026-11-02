@@ -8,7 +8,15 @@ import * as path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { PersonaRegistry } from "../extensions/egm/personas.ts";
-import { MAX_SPAWN_DEPTH, SubagentRunner } from "../extensions/egm/runner.ts";
+import {
+	CHILD_BASE_SYSTEM_PROMPT,
+	DEFAULT_TASK_TIMEOUT_MINUTES,
+	findReportProblem,
+	MAX_SPAWN_DEPTH,
+	NESTING_TIMEOUT_MULTIPLIER,
+	parseArtifactDirectory,
+	SubagentRunner,
+} from "../extensions/egm/runner.ts";
 
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const EGM_ROOT = path.join(PACKAGE_ROOT, "egm");
@@ -96,5 +104,54 @@ test("depth guard refuses spawning at MAX_SPAWN_DEPTH and restores after", () =>
 	} finally {
 		if (previous === undefined) delete process.env.EGM_PI_DEPTH;
 		else process.env.EGM_PI_DEPTH = previous;
+	}
+});
+
+test("child args replace pi's default prompt so a user SYSTEM.md cannot load", () => {
+	const args = makeRunner().buildChildArgs({ persona: "egm-design", task: "x" }, {}, "/tmp/p.md");
+	assert.equal(args[args.indexOf("--system-prompt") + 1], CHILD_BASE_SYSTEM_PROMPT);
+	// Passing --append-system-prompt is what keeps a user APPEND_SYSTEM.md out.
+	assert.ok(args.includes("--append-system-prompt"));
+});
+
+test("findReportProblem rejects empty and cut-off reports", () => {
+	assert.equal(findReportProblem("stop", "findings"), undefined);
+	assert.match(findReportProblem("stop", "  \n") ?? "", /without returning a report/);
+	assert.match(findReportProblem("length", "partial") ?? "", /cut off/);
+});
+
+test("parseArtifactDirectory reads the setting line and skips placeholders", () => {
+	assert.equal(parseArtifactDirectory("intro\nEGM artifact directory: .dev/docs  \nend"), ".dev/docs");
+	assert.equal(parseArtifactDirectory("EGM artifact directory: a\nEGM artifact directory: b"), "b");
+	assert.equal(parseArtifactDirectory("Set `EGM artifact directory: <path>` in AGENTS.md"), undefined);
+	assert.equal(parseArtifactDirectory("EGM artifact directory: <path>"), undefined);
+	assert.equal(parseArtifactDirectory(undefined), undefined);
+});
+
+test("artifact directory reaches writing personas only", () => {
+	const runner = makeRunner();
+	const note = "Artifact directory: /abs/docs";
+	assert.ok(runner.buildChildSystemPrompt({ persona: "egm-synthesizer", task: "x" }, "/abs/docs").includes(note));
+	assert.ok(!runner.buildChildSystemPrompt({ persona: "egm-design", task: "x" }, "/abs/docs").includes(note));
+	assert.ok(!runner.buildChildSystemPrompt({ persona: "egm-synthesizer", task: "x" }).includes("Artifact directory:"));
+});
+
+test("task timeout gives nesting personas longer and honors the env override", () => {
+	const runner = makeRunner();
+	const previous = process.env.EGM_PI_TIMEOUT_MINUTES;
+	try {
+		delete process.env.EGM_PI_TIMEOUT_MINUTES;
+		const leaf = DEFAULT_TASK_TIMEOUT_MINUTES * 60_000;
+		assert.equal(runner.taskTimeoutMs("egm-design"), leaf);
+		assert.equal(runner.taskTimeoutMs("egm-synthesizer"), leaf * NESTING_TIMEOUT_MULTIPLIER);
+
+		process.env.EGM_PI_TIMEOUT_MINUTES = "5";
+		assert.equal(runner.taskTimeoutMs("egm-design"), 300_000);
+
+		process.env.EGM_PI_TIMEOUT_MINUTES = "nonsense";
+		assert.equal(runner.taskTimeoutMs("egm-design"), leaf);
+	} finally {
+		if (previous === undefined) delete process.env.EGM_PI_TIMEOUT_MINUTES;
+		else process.env.EGM_PI_TIMEOUT_MINUTES = previous;
 	}
 });

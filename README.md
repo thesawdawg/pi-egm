@@ -50,15 +50,23 @@ Key mechanics:
 
 - **Isolation**: children run with `-nc -ns -np --no-themes -ne -na
   --no-session` — no conversation history, no AGENTS.md, no skills, no
-  discovered extensions, no project-local config. Only the two orchestrator
-  personas get this extension loaded (`-e`) so they can nest `egm_subagent`.
+  discovered extensions, no project-local config. They also get a fixed
+  `--system-prompt`, so a user `SYSTEM.md` cannot reach them. Only the two
+  orchestrator personas get this extension loaded (`-e`) so they can nest
+  `egm_subagent`.
+- **Failures**: a child that returns no report, or is cut off at the output
+  token limit, is reported as failed rather than completed.
+- **Timeouts**: read-only children stop after 30 minutes and orchestrators after
+  120. Set `EGM_PI_TIMEOUT_MINUTES` to change the read-only limit; orchestrators
+  get four times that value.
 - **Depth**: `EGM_PI_DEPTH` tracks delegation depth; `egm_subagent` refuses to
   spawn at depth 2 (Elephant → orchestrator → reviewers).
 - **Paths**: skill text references like `agents/`, `resources/`, `docs/`
   resolve against the vendored plugin root (`egm/`), told to both the parent
   (via system-prompt guidance) and each child (via an appended system prompt).
 - **Artifacts**: written to the working directory unless the user sets
-  `EGM artifact directory: <path>` in the prompt or AGENTS.md.
+  `EGM artifact directory: <path>` on its own line in the prompt or AGENTS.md.
+  The extension passes the setting to writing subagents automatically.
 
 ## Develop
 

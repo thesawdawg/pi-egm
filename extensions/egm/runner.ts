@@ -32,6 +32,29 @@ export const MAX_SPAWN_DEPTH = 2;
 /** Env var carrying the current delegation depth into child processes. */
 const DEPTH_ENV_VAR = "EGM_PI_DEPTH";
 
+/** Default wall-clock limit for a read-only child. */
+export const DEFAULT_TASK_TIMEOUT_MINUTES = 30;
+
+/**
+ * Nesting children wait on their own children, so their limit must outlast
+ * several full reviewer runs; otherwise a healthy Synthesizer dies first.
+ */
+export const NESTING_TIMEOUT_MULTIPLIER = 4;
+
+/** Env var overriding DEFAULT_TASK_TIMEOUT_MINUTES (slow local models need more). */
+const TIMEOUT_ENV_VAR = "EGM_PI_TIMEOUT_MINUTES";
+
+/** Env var carrying the resolved artifact directory to nested children. */
+const ARTIFACT_DIR_ENV_VAR = "EGM_PI_ARTIFACT_DIR";
+
+/**
+ * Replaces pi's default prompt so a user-level SYSTEM.md cannot reach a
+ * Goldfish: pi only consults that file when --system-prompt is absent.
+ */
+export const CHILD_BASE_SYSTEM_PROMPT =
+	"You are a delegated EGM subagent running non-interactively with a fresh context. " +
+	"Use your tools to do the task, then give your complete result in your final message; nobody can answer questions.";
+
 /** One delegated task, as accepted by the egm_subagent tool. */
 export interface SubagentTask {
 	/** Persona name from the registry, or "general". */
@@ -48,6 +71,8 @@ export interface DispatchDefaults {
 	model?: string;
 	/** Thinking level, or undefined to use pi's default. */
 	thinkingLevel?: ThinkingLevel;
+	/** Absolute artifact directory, or undefined to use the working directory. */
+	artifactDir?: string;
 }
 
 /** Aggregated usage reported by a child's assistant messages. */
@@ -64,8 +89,8 @@ export interface UsageStats {
 export interface SubagentResult {
 	persona: string;
 	task: string;
-	/** "completed" means the child exited cleanly; anything else is a failure. */
-	status: "completed" | "failed" | "aborted";
+	/** "completed" means the child delivered a full report; anything else is a failure. */
+	status: "completed" | "failed" | "aborted" | "timed_out";
 	exitCode: number;
 	/** Final assistant text, capped at PER_TASK_OUTPUT_CAP. */
 	output: string;
@@ -169,6 +194,35 @@ async function mapWithConcurrencyLimit<TIn, TOut>(
 }
 
 /**
+ * Finds the `EGM artifact directory: <path>` setting in prompt or context text.
+ * The last match wins because pi loads the most specific context file last.
+ *
+ * @param text - Text to search.
+ * @returns The configured path, or undefined when absent.
+ */
+export function parseArtifactDirectory(text: string | undefined): string | undefined {
+	if (!text) return undefined;
+	const matches = [...text.matchAll(/^[ \t]*EGM artifact directory:[ \t]*(\S.*?)[ \t]*$/gm)];
+	const value = matches.at(-1)?.[1];
+	return value && !value.startsWith("<") ? value : undefined;
+}
+
+/**
+ * Explains why a child that exited cleanly did not deliver a usable report.
+ * EGM treats a missing report as "not run", never as zero findings, and a
+ * cut-off report would otherwise pass for a complete one.
+ *
+ * @param stopReason - The child's final stop reason.
+ * @param output - The child's final assistant text.
+ * @returns The failure message, or undefined when the report is usable.
+ */
+export function findReportProblem(stopReason: string | undefined, output: string): string | undefined {
+	if (stopReason === "length") return "Report cut off at the model's output token limit; findings are incomplete.";
+	if (!output.trim()) return "Child finished without returning a report.";
+	return undefined;
+}
+
+/**
  * Runs EGM subagent tasks as child pi processes.
  */
 export class SubagentRunner {
@@ -222,6 +276,28 @@ export class SubagentRunner {
 	}
 
 	/**
+	 * Artifact directory inherited from a parent EGM process.
+	 *
+	 * @returns The inherited absolute path, or undefined at the root.
+	 */
+	inheritedArtifactDir(): string | undefined {
+		return process.env[ARTIFACT_DIR_ENV_VAR] || undefined;
+	}
+
+	/**
+	 * Wall-clock limit for one child of the given persona.
+	 *
+	 * @param persona - Persona name.
+	 * @returns The limit in milliseconds.
+	 */
+	taskTimeoutMs(persona: string): number {
+		const configured = Number.parseFloat(process.env[TIMEOUT_ENV_VAR] ?? "");
+		const minutes = configured > 0 ? configured : DEFAULT_TASK_TIMEOUT_MINUTES;
+		const multiplier = policyForPersona(persona).canNest ? NESTING_TIMEOUT_MULTIPLIER : 1;
+		return minutes * multiplier * 60_000;
+	}
+
+	/**
 	 * Validates persona names and task content without spawning.
 	 *
 	 * @param tasks - Tasks from the tool call.
@@ -248,9 +324,10 @@ export class SubagentRunner {
 	 * and the pi-specific path/tooling addendum.
 	 *
 	 * @param task - The delegated task.
+	 * @param artifactDir - Absolute artifact directory, if one is configured.
 	 * @returns Markdown text written to the --append-system-prompt file.
 	 */
-	buildChildSystemPrompt(task: SubagentTask): string {
+	buildChildSystemPrompt(task: SubagentTask, artifactDir?: string): string {
 		const sections: string[] = [];
 		const persona = this.registry.get(task.persona);
 		if (persona?.body.trim()) sections.push(persona.body.trim());
@@ -261,17 +338,19 @@ export class SubagentRunner {
 			? `Spawn subagents with the \`egm_subagent\` tool using persona names (or \`general\`). ` +
 				`Write files only where your instructions require it; every file path above still resolves against the EGM plugin root.`
 			: "You have no write or edit tools; deliver all findings in your final message.";
-		sections.push(
-			[
-				"---",
-				"",
-				"## Pi runtime notes (EGM)",
-				"",
-				`- EGM plugin root: ${this.egmRoot}. Resolve relative \`agents/\`, \`resources/\`, and \`docs/\` paths in these instructions against this directory.`,
-				"- If a file required by these instructions cannot be read, report an incomplete review instead of returning a verdict.",
-				`- ${toolingNote}`,
-			].join("\n"),
-		);
+		const notes = [
+			"---",
+			"",
+			"## Pi runtime notes (EGM)",
+			"",
+			`- EGM plugin root: ${this.egmRoot}. Resolve relative \`agents/\`, \`resources/\`, and \`docs/\` paths in these instructions against this directory.`,
+			"- If a file required by these instructions cannot be read, report an incomplete review instead of returning a verdict.",
+			`- ${toolingNote}`,
+		];
+		if (artifactDir && policy.canNest) {
+			notes.push(`- Artifact directory: ${artifactDir}. Write briefs and reports there, not to the working directory.`);
+		}
+		sections.push(notes.join("\n"));
 		return sections.join("\n\n");
 	}
 
@@ -302,6 +381,7 @@ export class SubagentRunner {
 		];
 		if (defaults.model) args.push("--model", defaults.model);
 		if (defaults.thinkingLevel) args.push("--thinking", defaults.thinkingLevel);
+		args.push("--system-prompt", CHILD_BASE_SYSTEM_PROMPT);
 		const policy = policyForPersona(task.persona);
 		args.push("--tools", policy.tools.join(","));
 		if (policy.canNest) args.push("-e", this.extensionPath);
@@ -338,8 +418,10 @@ export class SubagentRunner {
 		const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-egm-"));
 		const promptFilePath = path.join(tmpDir, `prompt-${task.persona.replace(/[^\w.-]+/g, "_")}.md`);
 		let wasAborted = false;
+		let timedOut = false;
+		const timeoutMs = this.taskTimeoutMs(task.persona);
 		try {
-			await fs.promises.writeFile(promptFilePath, this.buildChildSystemPrompt(task), {
+			await fs.promises.writeFile(promptFilePath, this.buildChildSystemPrompt(task, defaults.artifactDir), {
 				encoding: "utf-8",
 				mode: 0o600,
 			});
@@ -352,7 +434,11 @@ export class SubagentRunner {
 					cwd,
 					shell: false,
 					stdio: ["ignore", "pipe", "pipe"],
-					env: { ...process.env, [DEPTH_ENV_VAR]: String(this.currentDepth() + 1) },
+					env: {
+						...process.env,
+						[DEPTH_ENV_VAR]: String(this.currentDepth() + 1),
+						...(defaults.artifactDir ? { [ARTIFACT_DIR_ENV_VAR]: defaults.artifactDir } : {}),
+					},
 				});
 				let buffer = "";
 
@@ -393,14 +479,22 @@ export class SubagentRunner {
 					result.stderr += data.toString();
 				});
 				// `proc.killed` flips as soon as SIGTERM is sent, so check the real exit state instead.
-				const killProc = () => {
-					wasAborted = true;
+				const terminate = () => {
 					proc.kill("SIGTERM");
 					setTimeout(() => {
 						if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL");
 					}, 5000).unref();
 				};
+				const killProc = () => {
+					wasAborted = true;
+					terminate();
+				};
+				const timeout = setTimeout(() => {
+					timedOut = true;
+					terminate();
+				}, timeoutMs);
 				const finish = (code: number) => {
+					clearTimeout(timeout);
 					signal?.removeEventListener("abort", killProc);
 					resolve(code);
 				};
@@ -420,12 +514,17 @@ export class SubagentRunner {
 			result.output = capOutput(getFinalOutput(messages));
 			if (wasAborted) {
 				result.status = "aborted";
+			} else if (timedOut) {
+				result.status = "timed_out";
+				result.errorMessage = `Child stopped after reaching its ${timeoutMs / 60_000} minute limit.`;
 			} else if (
 				result.exitCode === 0 &&
 				result.stopReason !== "error" &&
 				result.stopReason !== "aborted"
 			) {
-				result.status = "completed";
+				const problem = findReportProblem(result.stopReason, result.output);
+				if (problem) result.errorMessage = problem;
+				else result.status = "completed";
 			}
 			return result;
 		} finally {

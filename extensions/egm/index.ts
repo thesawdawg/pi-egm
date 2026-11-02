@@ -14,6 +14,7 @@ import { Type } from "typebox";
 import { PersonaRegistry } from "./personas.ts";
 import {
 	MAX_PARALLEL_TASKS,
+	parseArtifactDirectory,
 	type SubagentResult,
 	SubagentRunner,
 	type SubagentTask,
@@ -66,7 +67,7 @@ export function buildEgmGuidance(egmRoot: string): string {
 		'- When EGM skill text says "spawn a subagent", use the `egm_subagent` tool with the persona name from `agents/*.md` frontmatter (e.g. `egm-zoom-out`). `egm-synthesizer` and `egm-bootstrap-orchestrator` may nest `egm_subagent` calls; maximum delegation depth is 2.',
 		'- For ad-hoc read-only scouts such as `goldfish-explorer`, call `egm_subagent` with persona `general` and pass the scout\'s system prompt via `systemPrompt`.',
 		'- The Codex/Claude lines in EGM skills ("first read docs/codex.md", `${CLAUDE_PLUGIN_ROOT}/docs/claude.md`) do not apply on pi; ignore them.',
-		"- Artifact directory: the working directory, unless the user sets `EGM artifact directory: <path>` in the prompt or AGENTS.md.",
+		"- Artifact directory: the working directory, unless the user sets `EGM artifact directory: <path>` in the prompt or AGENTS.md. egm_subagent passes this setting to its children automatically.",
 	].join("\n");
 }
 
@@ -78,8 +79,11 @@ export function buildEgmGuidance(egmRoot: string): string {
  */
 function formatResultSection(result: SubagentResult): string {
 	const status = result.status === "completed" ? "completed" : `failed (${result.status})`;
-	const output = result.output || result.errorMessage || result.stderr.trim() || "(no output)";
-	return `### [${result.persona}] ${status}\n\n${output}`;
+	// A failed child may still have partial text; the error must stay beside it
+	// so partial findings are never mistaken for a complete report.
+	const failure = result.status === "completed" ? "" : result.errorMessage || result.stderr.trim();
+	const body = [failure && `Error: ${failure}`, result.output].filter(Boolean).join("\n\n") || "(no output)";
+	return `### [${result.persona}] ${status}\n\n${body}`;
 }
 
 /**
@@ -92,6 +96,21 @@ export default function egmExtension(pi: ExtensionAPI): void {
 	const registry = PersonaRegistry.load(AGENTS_DIR);
 	const runner = new SubagentRunner(registry, EGM_ROOT, EXTENSION_PATH);
 	const guidance = buildEgmGuidance(EGM_ROOT);
+	// A prompt setting outlives its turn, like the skill workflow it configures.
+	let promptArtifactDir: string | undefined;
+	let contextArtifactDir: string | undefined;
+
+	/**
+	 * Resolves the artifact directory for this process's children: prompt first,
+	 * then context files, then whatever a parent EGM process passed down.
+	 *
+	 * @param cwd - Directory a relative setting resolves against.
+	 * @returns The absolute directory, or undefined when unset.
+	 */
+	const resolveArtifactDir = (cwd: string): string | undefined => {
+		const configured = promptArtifactDir ?? contextArtifactDir ?? runner.inheritedArtifactDir();
+		return configured ? path.resolve(cwd, configured) : undefined;
+	};
 
 	pi.registerTool({
 		name: "egm_subagent",
@@ -129,6 +148,7 @@ export default function egmExtension(pi: ExtensionAPI): void {
 				{
 					model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 					thinkingLevel: ctx.thinkingLevel,
+					artifactDir: resolveArtifactDir(ctx.cwd),
 				},
 				signal,
 				(result, done, total) => {
@@ -180,7 +200,12 @@ export default function egmExtension(pi: ExtensionAPI): void {
 
 	// 0.84.2 has no systemPromptOptions.sections; replace the assembled prompt
 	// with itself plus our constant section (chained safely with other extensions).
-	pi.on("before_agent_start", (event) => ({
-		systemPrompt: `${event.systemPrompt}\n\n${guidance}`,
-	}));
+	pi.on("before_agent_start", (event) => {
+		// Children run with no context files, so capture the setting here instead
+		// of relying on the model to relay it.
+		contextArtifactDir = parseArtifactDirectory(event.systemPrompt);
+		const prompt = "prompt" in event ? event.prompt : undefined;
+		promptArtifactDir = parseArtifactDirectory(prompt) ?? promptArtifactDir;
+		return { systemPrompt: `${event.systemPrompt}\n\n${guidance}` };
+	});
 }

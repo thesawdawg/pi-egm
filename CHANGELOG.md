@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- `egm_subagent` reports a child that returns no report, or is cut off at the
+  output token limit, as failed instead of completed.
+- Child `pi` processes no longer load a user-level `SYSTEM.md`.
+- `EGM artifact directory` now reaches writing subagents, which run without
+  context files.
+
+### Added
+
+- Per-child timeouts: 30 minutes for read-only personas, 120 for orchestrators.
+  `EGM_PI_TIMEOUT_MINUTES` overrides the read-only limit.
+
 ## [0.1.0]
 
 ### Added
