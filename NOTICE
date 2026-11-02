@@ -1,0 +1,13 @@
+pi-egm
+======
+
+This package vendors the Elephant-Goldfish Model (EGM) from
+https://github.com/google/elephant-goldfish-model, Copyright Google LLC,
+licensed under the Apache License, Version 2.0.
+
+The `egm/` directory is an unmodified copy of the upstream project at the
+commit recorded in `egm/UPSTREAM.json` (see `scripts/sync-egm.mjs` to update
+it). The `extensions/`, `scripts/`, and `test/` directories are original to
+this package.
+
+This package is not an official Google product.
