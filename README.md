@@ -71,6 +71,9 @@ Key mechanics:
   such as `/path/to/provider.ts,builtin:llama.cpp`. Those extensions run in
   every child and can change what reviewers see, so list only what the model
   needs.
+- **Review records**: the guidance tells the model to copy
+  `goldfish_review_report.md` to `goldfish_review_report_stage<N>_round<M>.md`
+  before a later round or stage overwrites it. Upstream reuses that one filename.
 - **Filesystem**: isolation covers context and tools. Reviewers can still read
   any file your account can.
 - **Paths**: skill text references like `agents/`, `resources/`, `docs/`

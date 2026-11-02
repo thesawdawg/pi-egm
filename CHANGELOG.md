@@ -16,6 +16,8 @@
   Codex docs it tells the model to skip, and explains how to reach hidden skills.
 - Long reports no longer contain corrupted characters from split UTF-8 in child
   output or truncation.
+- Guidance now keeps a copy of `goldfish_review_report.md` before a later review
+  round or stage overwrites it.
 - Model setup failures in children now explain how to fix them.
 
 ### Added

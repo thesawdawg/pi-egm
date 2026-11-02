@@ -72,6 +72,7 @@ export function buildEgmGuidance(egmRoot: string): string {
 		"  - Give a subagent only its task, absolute paths to the target, standards, and supplied Goldfish context. Never copy this conversation, your reasoning, or answers the document is supposed to explain.",
 		"  - Reviewers cannot open URLs. Save a page to a workspace file and pass that path instead.",
 		"  - A reviewer that fails, times out, or returns no report did not review. Retry it once, then report it as not run.",
+		"  - `goldfish_review_report.md` is reused by every review round and stage. Before anything overwrites it, copy it unchanged to `goldfish_review_report_stage<N>_round<M>.md` in the same folder, so earlier findings and decisions stay on record.",
 		"  - pi has no question tool, so ask gate questions as one plain-text question and end your turn. No answer is not approval.",
 		"- Artifact directory: the working directory, unless the user sets `EGM artifact directory: <path>` in the prompt or AGENTS.md. egm_subagent passes this setting to its children automatically.",
 	].join("\n");
